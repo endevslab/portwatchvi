@@ -177,6 +177,12 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Key of [`Lower::handles`]: IR block, site, ..., and a lane-mask pair.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+/// Per IR block with `split_lds`: whether every lane runs it, and where the
+/// host waves meet around lane branches.
+type LdsMeetings = (Vec<bool>, Vec<(bool, bool)>);
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -206,7 +212,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    handles: HashMap<HandleKey, V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -238,7 +244,7 @@ struct Lower<'a> {
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
-    lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    lds_meet: Option<LdsMeetings>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -1085,7 +1091,8 @@ fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedL
     packs.sort_unstable();
     packs.dedup_by_key(|p| p.0);
     // Per parameter: its first row, the dwords used, the elements.
-    let mut layout: Vec<(u8, u8, Vec<(u8, u8, u8, u8)>)> = Vec::new();
+    type PackedParameter = (u8, u8, Vec<(u8, u8, u8, u8)>);
+    let mut layout: Vec<PackedParameter> = Vec::new();
     let mut behind = Vec::new();
     for &(a, b) in &packs {
         let mut placed = Vec::new();
@@ -1247,7 +1254,7 @@ impl<'a> Lower<'a> {
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
-        let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
+        let mut lds_meet: Option<LdsMeetings> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter

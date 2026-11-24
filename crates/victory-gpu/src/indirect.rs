@@ -373,6 +373,8 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // SAFETY: the command list is open for recording; the barriers, root
+    // signature, pipeline state and views all reference owned, live resources.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -697,7 +699,7 @@ void main() {
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
         let at = PIECE + 1234;
-        // SAFETY (each): inside the mapping.
+        // SAFETY: `now_ptr` points at a live mapped buffer owned by this test.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
         assert_eq!(run(&mut warp, 0), [7, 7, 7]);
@@ -1031,7 +1033,7 @@ void main() {
             };
             for (i, groups) in filled.into_iter().enumerate() {
                 let rec = &out[i * 8..i * 8 + 4];
-                assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
+                assert_eq!(rec, [groups, 1, 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
             }
             let charged_filled = (5 + 519) * 128;
             if ahead {

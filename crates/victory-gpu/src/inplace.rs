@@ -613,7 +613,8 @@ fn describe(heap: &ID3D12Heap) -> String {
 /// (committed, read-write, write-watched): a part of it opened.
 unsafe fn private(p: &mut Probe, rig: &mut Rig) {
     const SIZE: usize = 64 * K64;
-    // SAFETY (the whole function): the allocation below, `SIZE` bytes.
+    // SAFETY: the allocation below is `SIZE` bytes, committed and
+    // write-watched, and is released before the function returns.
     unsafe {
         let base = mem::VirtualAlloc(std::ptr::null(), SIZE, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
         if base.is_null() {
@@ -680,8 +681,8 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
 /// pages: reserved (as it is made today) and committed.
 unsafe fn section(p: &mut Probe, rig: &mut Rig) {
     const SIZE: usize = 32 * K64;
-    // SAFETY (the whole function): the sections, placeholder and views
-    // made below.
+    // SAFETY: the section, placeholder and views made below are valid
+    // handles, each closed or unmapped before the function returns.
     unsafe {
         let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
         let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -756,7 +757,8 @@ unsafe fn cost(p: &mut Probe, rig: &mut Rig, memory: &dyn Fn() -> Option<[u64; 4
     let bytes = mb << 20;
     let shared = || memory().map_or(0, |m| m[3] >> 20);
     let ms = |speed: Option<f64>| speed.map_or("?".to_owned(), |ms| format!("{ms:.1}"));
-    // SAFETY (the whole function): the allocation and the section below.
+    // SAFETY: the allocation and section made below are valid and are
+    // released before the function returns.
     unsafe {
         let base = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
         if !base.is_null() {

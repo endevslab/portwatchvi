@@ -318,7 +318,7 @@ fn mesh_kept(pipeline: usize) -> bool {
     let Some(at) = p.name.find("mesh ") else {
         return true;
     };
-    let hash = p.name[at + 5..].as_bytes();
+    let hash = &p.name.as_bytes()[at + 5..];
     if hash.len() < 16 {
         return true;
     }
@@ -3160,6 +3160,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
+            // Collapsing this into a guard would split the arm and repeat
+            // the note above, so the lint is let through here.
+            #[allow(clippy::collapsible_match)]
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
             }
