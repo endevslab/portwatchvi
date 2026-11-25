@@ -279,9 +279,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
-/// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// Whether a texture refresh waits for the runtime to finish remapping
+/// title memory: it does not, unless `VICTORY_TEXTURE_WAIT=1` asks for it.
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -291,22 +290,57 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// have 4, 15 and 16 frame lines with over 300 ms of "textures", up to
 /// 3,708 ms, and on every one of them the wait for this lock is the whole
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
-/// ms, the texture's own lock 0).
+/// ms, the texture's own lock 0). Measured in the world (`diag` build,
+/// 5 s windows): 2,780 ms a frame with 1,188 ms of "textures", 964 ms of
+/// them this wait; with the wait gone, 1,635 ms a frame and 16 ms of
+/// "textures" (task `fluid-world-frames`, T1).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
+/// So the refresh asks for the lock without waiting. If the runtime has it,
+/// the texture is read through the kernel instead, which needs no lock: it
+/// fails if a page is not there, and then the texture is left as it is and
+/// read at its next refresh, a frame later. A read through the kernel costs
+/// about 0.6 ms a megabyte against 0.3 in place.
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
-fn no_wait() -> bool {
+///
+/// `VICTORY_TEXTURE_WAIT=1` puts the wait back, for a run to compare
+/// against. `VICTORY_TEXTURE_NO_WAIT=1`, which used to turn the wait off,
+/// still means what it says and is what a run without either gets; an
+/// instruction written down as `VICTORY_TEXTURE_NO_WAIT=0` is a blocking
+/// run now only if it also says `VICTORY_TEXTURE_WAIT=1`.
+fn waits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        waits_given(
+            std::env::var_os("VICTORY_TEXTURE_WAIT").as_deref(),
+            std::env::var_os("VICTORY_TEXTURE_NO_WAIT").as_deref(),
+        )
+    })
 }
 
-/// Since the last frame-rate line, with [`no_wait`]: refreshes that read
+/// [`waits`], from the two variables' values: `VICTORY_TEXTURE_WAIT=1`
+/// asks for the wait, and `VICTORY_TEXTURE_NO_WAIT=1` says there is none,
+/// which wins when both are set (it is the older switch, and the one a run
+/// already has written down). Neither set: no wait.
+fn waits_given(wait: Option<&std::ffi::OsStr>, no_wait: Option<&std::ffi::OsStr>) -> bool {
+    if no_wait.is_some_and(|v| v == "1") {
+        return false;
+    }
+    wait.is_some_and(|v| v == "1")
+}
+
+/// The hold on title memory a refresh takes ([`waits`]): waited for when it
+/// is asked for, and asked for at once otherwise, in which case `None` says
+/// the runtime has it and the refresh reads through the kernel instead.
+fn mapping(wait: bool) -> Option<crate::watch::Reading> {
+    if wait {
+        return Some(waited(2, crate::watch::title_memory_reading));
+    }
+    crate::watch::title_memory_reading_now()
+}
+
+/// Since the last frame-rate line, with [`waits`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -315,8 +349,9 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// microseconds: waiting for the texture's own lock (another thread is
 /// refreshing the same texture), asking the write watch and the guards,
 /// waiting for title memory to hold still (the lock the runtime takes
-/// alone while it remaps, `crate::watch::title_memory_reading`), and the
-/// refreshes in all.
+/// alone while it remaps, `crate::watch::title_memory_reading`; only a
+/// refresh that asks for the wait takes it, so this reads 0 by default,
+/// see [`waits`]), and the refreshes in all.
 ///
 /// While the world streams in, the frame line's "textures" is seconds a
 /// frame in some runs and tenths in others for the same megabytes (2,566
@@ -375,6 +410,30 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
     with_read(size, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
         f(read)
+    })
+}
+
+/// Reads the `size` bytes of title memory at `memory` through the kernel, as
+/// a refresh does while the runtime has the mapping lock and the refresh
+/// does not wait for it ([`waits`]): hashes them, and hands them to `detile`
+/// if they differ from what `last` holds. `false` when a page of it is not
+/// there at this moment: nothing is taken then.
+fn read_through_kernel(
+    memory: *const u8,
+    size: usize,
+    last: &mut Last,
+    detile: impl FnOnce(&[u8]),
+) -> bool {
+    with_read(size, |read| {
+        if !crate::host::read_into(memory, read) {
+            return false;
+        }
+        let hash = blake3::hash(read);
+        if last.hash != Some(hash) {
+            last.hash = Some(hash);
+            detile(read);
+        }
+        true
     })
 }
 
@@ -726,16 +785,11 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let Some(_mapped) = mapping(waits()) else {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
+            // all (`waits`).
+            return self.refresh_unlocked(last, size);
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -803,7 +857,7 @@ impl Staging {
         size
     }
 
-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
+    /// A refresh while the runtime is remapping title memory ([`waits`]):
     /// the texture is read through the kernel, which fails if a page of it
     /// is not there at this moment. Then nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
@@ -811,17 +865,7 @@ impl Staging {
     /// Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-            }
-            true
-        });
+        let read = read_through_kernel(self.memory, size, last, |read| self.detile(read));
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
             size
@@ -1275,5 +1319,155 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mapping_wait_tests {
+    use super::{Last, REFRESH_WAITS, mapping, read_through_kernel, waits, waits_given};
+    use crate::watch::title_memory_remapping;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    /// The mapping lock is process-wide, so a test that needs to find it free
+    /// must not run beside one that holds it: these tests take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn one_at_a_time() -> MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Title memory the tests here read: pages of our own, written once, read
+    /// the two ways a refresh reads it — in place, under the mapping lock,
+    /// and through the kernel while the runtime holds that lock.
+    struct Source {
+        base: *mut u8,
+        size: usize,
+    }
+
+    impl Source {
+        fn new(size: usize) -> Self {
+            use windows_sys::Win32::System::Memory::*;
+            // SAFETY: an allocation of our own; the bytes are written here and
+            // only read afterwards.
+            unsafe {
+                let base = VirtualAlloc(
+                    std::ptr::null(),
+                    size,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+                .cast::<u8>();
+                assert!(!base.is_null());
+                for i in 0..size {
+                    base.add(i).write((i * 7 + i / 251) as u8);
+                }
+                Self { base, size }
+            }
+        }
+
+        /// The bytes a refresh reads in place, with the mapping lock held.
+        fn in_place(&self) -> &[u8] {
+            // SAFETY: committed memory of this allocation, read only.
+            unsafe { std::slice::from_raw_parts(self.base, self.size) }
+        }
+
+        /// The decision `Staging::refresh_unlocked` takes: whether the kernel
+        /// read the bytes, and the bytes that were detiled.
+        fn through_kernel(&self, last: &mut Last) -> (bool, Vec<u8>) {
+            let mut detiled = Vec::new();
+            let read = read_through_kernel(self.base, self.size, last, |bytes| {
+                detiled.extend_from_slice(bytes)
+            });
+            (read, detiled)
+        }
+    }
+
+    impl Drop for Source {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: this allocation, released once.
+            unsafe { assert_ne!(VirtualFree(self.base.cast(), 0, MEM_RELEASE), 0) };
+        }
+    }
+
+    /// A refresh that finds the runtime remapping title memory does not wait
+    /// for it, and the bytes it reads are the bytes a refresh reads in place
+    /// when the lock is free. Nothing lands in the "waiting for title memory
+    /// to hold still" figure; the kernel read itself is timed where the
+    /// refresh is timed, so the frame line's "textures" keeps it.
+    #[test]
+    fn a_refresh_reads_the_same_bytes_without_waiting_while_the_lock_is_held() {
+        let _serial = one_at_a_time();
+        let source = Source::new(64 << 10);
+        // The lock is free: the refresh takes it and reads in place.
+        let free = {
+            let held = mapping(false).expect("the mapping lock is free");
+            let bytes = source.in_place().to_vec();
+            drop(held);
+            bytes
+        };
+        // The runtime is remapping: it holds the lock until the refresh below
+        // says it is done, and lets go by itself after two seconds, so that a
+        // refresh which waits fails here instead of hanging.
+        let (holding, locked) = mpsc::channel();
+        let (let_go, release) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let remapping = title_memory_remapping();
+            holding.send(()).unwrap();
+            let _ = release.recv_timeout(Duration::from_secs(2));
+            drop(remapping);
+        });
+        locked.recv().unwrap();
+        let waiting = REFRESH_WAITS[2].load(Ordering::Relaxed);
+        let started = Instant::now();
+        let taken = mapping(waits());
+        let took = started.elapsed();
+        let mut last = Last::default();
+        let (read, detiled) = source.through_kernel(&mut last);
+        let waiting_after = REFRESH_WAITS[2].load(Ordering::Relaxed);
+        let _ = let_go.send(());
+        writer.join().unwrap();
+        assert!(taken.is_none(), "a refresh waited for the runtime to stop remapping");
+        assert!(took < Duration::from_secs(1), "the refresh spent {took:?} finding the lock held");
+        assert!(read, "the kernel read the bytes of a texture while its memory is remapped");
+        assert_eq!(detiled, free, "the bytes read through the kernel while the lock is held");
+        assert_eq!(
+            waiting_after, waiting,
+            "nothing was added to the wait for title memory to hold still"
+        );
+    }
+
+    /// The blocking opt-out: `VICTORY_TEXTURE_WAIT=1` takes the lock the old
+    /// way, waiting for the remapping to end, and the time it waited is what
+    /// the "waiting for title memory to hold still" figure reports.
+    /// `VICTORY_TEXTURE_NO_WAIT=1` still says no wait, and with neither set
+    /// there is none.
+    #[test]
+    fn the_blocking_opt_out_waits_for_the_lock_and_no_wait_still_says_so() {
+        let _serial = one_at_a_time();
+        use std::ffi::OsStr;
+        let one = Some(OsStr::new("1"));
+        assert!(!waits_given(None, None), "with neither set a refresh does not wait");
+        assert!(!waits_given(None, one), "VICTORY_TEXTURE_NO_WAIT=1 still says no wait");
+        let opt_out = waits_given(one, None);
+        assert!(opt_out, "VICTORY_TEXTURE_WAIT=1 asks for the wait");
+        assert!(!waits_given(one, one), "the switch a run already has written down wins");
+        let (holding, locked) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let remapping = title_memory_remapping();
+            holding.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(remapping);
+        });
+        locked.recv().unwrap();
+        let before = REFRESH_WAITS[2].load(Ordering::Relaxed);
+        let held = mapping(opt_out);
+        let waited = REFRESH_WAITS[2].load(Ordering::Relaxed) - before;
+        writer.join().unwrap();
+        assert!(held.is_some(), "the opt-out takes the lock itself");
+        assert!(waited >= 20_000, "the wait for the remapping is reported: {waited} us");
     }
 }
