@@ -26,7 +26,15 @@ if ($Rest.Count -ge 1 -and $Rest[0]) {
     $Rest[0] = (Resolve-Path -LiteralPath $Rest[0] -ErrorAction Stop).ProviderPath
 }
 if ($Rest.Count -ge 2 -and $Rest[1]) {
-    $Rest[1] = [System.IO.Path]::GetFullPath($Rest[1], $PWD.Path)
+    # Windows PowerShell 5.1 runs on .NET Framework, where Path.GetFullPath has
+    # only the one-argument overload; resolve a relative root against the
+    # caller's directory with Join-Path instead.
+    $Rest[1] = if ([System.IO.Path]::IsPathRooted($Rest[1])) {
+        $Rest[1]
+    }
+    else {
+        Join-Path $PWD.Path $Rest[1]
+    }
 }
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Repo
