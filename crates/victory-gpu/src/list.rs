@@ -1591,9 +1591,21 @@ mod state {
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`: the console's
+    /// mesh dispatch, whose group counts are in GPU memory when it gives
+    /// arguments.
+    ///
+    /// Those dispatches were dropped, so a frame's meshlet culling never ran
+    /// and the mesh draws after it read the previous frame's payload (S5 of
+    /// `odd/tasks/fluid-world-frames.md`: the smeared silhouette). They run as
+    /// `ExecuteIndirect` of one mesh dispatch record (`crate::draw`'s
+    /// `execute_indirect`, kind 10: the three group counts at the given
+    /// address, 12 bytes), so they go through the same argument clamp and
+    /// charge the same list budget as the title's indirect draws
+    /// (`crate::indirect`); a record the budget has no room for runs empty.
+    /// What the host cannot run that way is still dropped and counted per
+    /// frame (`take_mesh_runs`). The payload buffer is not read: the host's
+    /// mesh pipeline carries the payload in the shader's own group output.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1602,12 +1614,22 @@ mod state {
         _payload: u64,
     ) {
         super::count_draw();
-        if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
-            return;
+        match super::mesh_call(x, indirect) {
+            super::MeshCall::Direct(groups) => {
+                with_state(this, |list, s| s.dispatch_mesh(list, groups))
+            }
+            super::MeshCall::Indirect(arguments) => {
+                // A mesh dispatch record: the three group counts, once.
+                const MESH: u32 = 10;
+                const RECORD: u32 = 12;
+                const ONCE: u32 = 1;
+                let mut ran = false;
+                with_state(this, |list, s| {
+                    ran = s.execute_indirect(list, (MESH, RECORD, ONCE), arguments, None);
+                });
+                super::count_mesh(ran);
+            }
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1731,6 +1753,67 @@ pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a `DispatchMeshX` runs: the group count it is given, or one mesh
+/// dispatch record at the address whose memory holds the counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshCall {
+    Direct(u32),
+    Indirect(u64),
+}
+
+/// [`MeshCall`] for the console's `DispatchMeshX(x, flags, arguments,
+/// payload)`: with no arguments `x` groups are dispatched, and with them the
+/// counts are the record's, `x` being no fallback.
+pub(crate) fn mesh_call(x: u32, indirect: u64) -> MeshCall {
+    if indirect == 0 {
+        MeshCall::Direct(x)
+    } else {
+        MeshCall::Indirect(indirect)
+    }
+}
+
+/// Mesh dispatches the host ran from arguments in GPU memory since the last
+/// call, the ones it could not run, and the ones a spent clamp budget ran
+/// empty (their payload keeps what it held).
+pub(crate) struct MeshRuns {
+    pub(crate) ran: u64,
+    pub(crate) skipped: u64,
+    pub(crate) emptied: u64,
+}
+
+/// The mesh dispatch counts since the last call, per frame line.
+pub(crate) fn take_mesh_runs() -> MeshRuns {
+    use std::sync::atomic::Ordering::Relaxed;
+    MeshRuns {
+        ran: MESH_RUNS.swap(0, Relaxed),
+        skipped: MESH_SKIPPED.swap(0, Relaxed),
+        emptied: MESH_EMPTIED.swap(0, Relaxed),
+    }
+}
+
+/// Counts a mesh dispatch from arguments in GPU memory: it ran (`ran`), or
+/// the host could not run it (its reason is counted with the dropped draws).
+pub(crate) fn count_mesh(ran: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if ran {
+        MESH_RUNS.fetch_add(1, Relaxed);
+    } else {
+        MESH_SKIPPED.fetch_add(1, Relaxed);
+    }
+}
+
+/// Counts mesh dispatch records the argument clamp emptied past the list's
+/// budget (`crate::indirect`'s shader, through `host`'s budget buffer).
+pub(crate) fn note_mesh_emptied(records: u64) {
+    if records > 0 {
+        MESH_EMPTIED.fetch_add(records, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+static MESH_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MESH_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MESH_EMPTIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2167,6 +2250,37 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A mesh dispatch whose group count is in GPU memory runs as one
+    /// indirect mesh record; one that gives its counts runs directly.
+    #[test]
+    fn a_mesh_dispatch_takes_its_group_count_from_memory_or_from_the_call() {
+        assert_eq!(mesh_call(64, 0), MeshCall::Direct(64));
+        assert_eq!(
+            mesh_call(0, 0x7fff_0000_1234),
+            MeshCall::Indirect(0x7fff_0000_1234)
+        );
+        // The count in the record is the one that runs: `x` is not a
+        // fallback for a dispatch that has arguments.
+        assert_eq!(mesh_call(64, 0x1000), MeshCall::Indirect(0x1000));
+    }
+
+    /// The frame line's mesh counters are per frame and go back to zero.
+    #[test]
+    fn mesh_dispatch_counts_are_taken_per_frame() {
+        count_mesh(true);
+        count_mesh(false);
+        count_mesh(false);
+        note_mesh_emptied(3);
+        let runs = take_mesh_runs();
+        assert_eq!((runs.ran, runs.skipped, runs.emptied), (1, 2, 3));
+        let again = take_mesh_runs();
+        assert_eq!(
+            (again.ran, again.skipped, again.emptied),
+            (0, 0, 0),
+            "taken once"
+        );
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

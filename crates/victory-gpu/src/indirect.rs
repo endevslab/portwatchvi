@@ -13,7 +13,9 @@
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
 //! groups counted as 64 threads, mesh groups as 128): active records past it
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
-//! garbage records cannot run for seconds either.
+//! garbage records cannot run for seconds either. A mesh dispatch record so
+//! emptied is counted in the budget buffer's fourth word, which the frame
+//! line reads: its dispatch runs empty and its payload keeps what it held.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
@@ -124,6 +126,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+            // Diagnostics, in the budget buffer's fourth word: a mesh
+            // dispatch the budget emptied. It runs with no groups, so the
+            // payload it would have filled keeps what it held.
+            uint emptied;
+            budget.InterlockedAdd(12, 1, emptied);
         }
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < stride; off += 4) {
@@ -1048,6 +1055,100 @@ void main() {
                 assert_eq!(spent, charged_filled + 13 * 65535 * 128, "clamped one by one, each slot is charged the most");
                 assert_eq!(largest, u32::MAX);
             }
+        }
+    }
+
+    /// A mesh dispatch record the list's budget has no room for comes out
+    /// empty, and is counted in the budget buffer's fourth word: that is the
+    /// frame line's count of mesh dispatches that ran empty and left their
+    /// payload as it was. A record that fits is not counted.
+    #[test]
+    fn warp_mesh_records_past_the_budget_come_out_empty_and_are_counted() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 32;
+        const RECORDS: u32 = 3;
+        const SPENT: usize = 3; // the budget buffer's words: spent, largest, asked, emptied
+        const BUDGET: u32 = 1 << 27;
+        let groups = [7u32, 9, 11];
+        let total = (STRIDE * RECORDS) as usize;
+        let mut src = vec![0u8; total];
+        for (i, g) in groups.into_iter().enumerate() {
+            let words = [g, 1, 1, 0xC0DE];
+            for (w, word) in words.into_iter().enumerate() {
+                let at = i * STRIDE as usize + w * 4;
+                src[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        for spent_before in [0u32, BUDGET] {
+            let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+            let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+            let dst_buf = warp.default_uav(total as u64);
+            // SAFETY: mapped buffers of these sizes; the budget word holds
+            // what the draws before this dispatch already spent.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(readback_ptr, 0, total);
+                (budget_ptr as *mut u32).write_volatile(spent_before);
+            }
+            assert!(record_clamp(
+                &warp.clamp,
+                &warp.list,
+                &dst_buf,
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (KIND_MESH, STRIDE, RECORDS),
+            ));
+            done_on(&warp.list, &dst_buf);
+            // SAFETY: an open list; the scratch buffer is copied for the check.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                warp.list
+                    .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+                warp.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the work is done; mapped buffers.
+            let (emptied, largest, out) = unsafe {
+                (
+                    (budget_ptr as *const u32).add(SPENT).read_volatile(),
+                    (budget_ptr as *const u32).add(1).read_volatile(),
+                    std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
+                        .to_vec(),
+                )
+            };
+            let fits = spent_before == 0;
+            for (i, g) in groups.into_iter().enumerate() {
+                let rec = &out[i * 8..i * 8 + 4];
+                let want = if fits {
+                    [g, 1, 1, 0xC0DE]
+                } else {
+                    [0, 0, 0, 0xC0DE]
+                };
+                assert_eq!(rec, want, "mesh record {i} with {spent_before} spent");
+            }
+            assert_eq!(
+                emptied,
+                if fits { 0 } else { RECORDS },
+                "only records the budget emptied are counted ({spent_before} spent)"
+            );
+            assert_eq!(
+                largest, 11,
+                "a record the budget empties still says what it asked for"
+            );
         }
     }
 

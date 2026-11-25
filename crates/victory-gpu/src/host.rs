@@ -5110,13 +5110,19 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
+            // asked for, the groups asked in all, the records the budget
+            // emptied): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
-                let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                let (largest, all, emptied) = (
+                    words.add(1).read_volatile(),
+                    words.add(2).read_volatile(),
+                    words.add(3).read_volatile(),
+                );
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                crate::list::note_mesh_emptied(u64::from(emptied));
+                for k in 0..4 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -5792,8 +5798,15 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let mesh = crate::list::take_mesh_runs();
+        let mesh_ran = mesh.ran as f64 / frames;
+        let mesh_skipped = mesh.skipped as f64 / frames;
+        let mesh_emptied = mesh.emptied as f64 / frames;
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: {mesh_ran:.0} run as ExecuteIndirect of a mesh record (the title's group counts in GPU \
+             memory), {mesh_skipped:.0} skipped (the host could not run them: their reasons are with the dropped draws'), \
+             {mesh_emptied:.0} run empty past the clamp budget (their payload keeps what it held); the largest group count \
+             asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
         card_clock_line(frames, ms);
