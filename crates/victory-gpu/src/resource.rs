@@ -1151,16 +1151,16 @@ struct Hosted {
     used: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
-    /// Its host copy was let go as idle once.
+    /// Its host copy was let go by the sweep once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
-/// alive and their bytes; such copies let go as idle since the start and
-/// their bytes; made again after that and their bytes; and host copies made
-/// since the start.
+/// alive and their bytes; such copies the sweep let go of since the start
+/// (their title memory gone, or over [`copies_most`]) and their bytes; made
+/// again after that and their bytes; and host copies made since the start.
 #[cfg(windows)]
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
@@ -1618,11 +1618,18 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames;
+/// - and either the title memory behind it is gone (a byte of it cannot be
+///   read any more: there is nothing left to copy from, and nothing to come
+///   back, at that address) or the copies this may let go of hold more than
+///   [`copies_most`], the longest unasked for going first.
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
-/// address is what views and lists name.
+/// address is what views and lists name. A placed texture whose title memory
+/// is gone and whose copy went leaves [`PLACED_TEXTURES`] too ([`forget_placed`]):
+/// the title asks for a placed texture at the address it streamed it to, and
+/// that address will not come back.
 /// shortcut: [`host_resource`] hands out the host texture without holding
 /// it; a thread that asked for it and has not yet recorded its use (which
 /// makes the list or the slot hold it) is protected by that idle time alone.
@@ -1637,35 +1644,74 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
+    // Their idle threshold, scaled by the card's actual pressure rather than a
+    // constant, and our byte budget and gone-entries sweep on top of it.
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let most = copies_most();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
-            continue;
-        }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+    // Placed textures whose title memory is gone and whose copy went: their
+    // entries hold nothing any ask can find ([`forget_placed`]).
+    let mut placed_gone: Vec<usize> = Vec::new();
+    {
+        // Held from the look to the release: `hosted` hands a copy out under
+        // the same lock, so none is handed out in between.
+        let all = textures();
+        // What the copies this may let go of hold in all.
+        let mut alive = 0u64;
+        let mut named = Vec::new();
+        for &at in all.iter() {
+            // SAFETY: a texture leaves the table before it is freed, under
+            // the lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                continue;
+}            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((host, _)) = made.as_ref() else {
+                continue;
+            };
+            alive += host.bytes;
+            // Cheapest first: the copy's count, then its texture's (a pair of
+            // calls), then a byte of title memory through the kernel.
+            let alone = std::sync::Arc::strong_count(host) == 1;
+            let unseen = alone && crate::host::references(&host.texture) == 1;
+            let used = r.host.used.load(Relaxed);
+            let idle = crate::host::long_ago(used, idle_ms, IDLE_FRAMES);
+            let mut byte = [0u8; 1];
+            named.push(Named {
+                at,
+                used,
+                bytes: host.bytes,
+                alone,
+                unseen,
+                gone: unseen && idle && !crate::host::read_into(r.data(), &mut byte),
+                idle,
             });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                made.take()
-            } else {
-                None
+        }
+        for at in choose(named, alive, most) {
+            // SAFETY: as above.
+            let r = unsafe { &*(at as *const Resource) };
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((host, _)) = made.as_ref() else {
+                continue;
+            };
+            // The guards again, under the lock: something may have asked for
+            // it between the look and here.
+            if std::sync::Arc::strong_count(host) > 1
+                || crate::host::references(&host.texture) > 1
+                || !crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+            {
+                continue;
             }
-        };
-        if let Some((host, _)) = gone {
+            let mut byte = [0u8; 1];
+            let gone = r.host.placed.load(Relaxed) && !crate::host::read_into(r.data(), &mut byte);
+            // Under the lock: the next use must not find the staging state of
+            // the texture let go (it says "uploaded").
+            crate::texture::unstage(at as This);
+            let Some((host, _)) = made.take() else {
+                continue;
+            };
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -1673,6 +1719,9 @@ pub(crate) fn let_go_idle() {
             bytes += host.bytes;
             if first.is_none() {
                 first = Some(at);
+            }
+            if gone {
+                placed_gone.push(at);
             }
             crate::host::retire(host);
         }
@@ -1686,6 +1735,142 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+    if !placed_gone.is_empty() {
+        let entries = forget_placed(&placed_gone);
+        if entries > 0 {
+            crate::host::trail(|| {
+                let left = placed_textures_left();
+                format!(
+                    "sweep: {entries} placed textures whose title memory is gone let go, entry and all ({left} entries left)"
+                )
+            });
+        }
+    }
+}
+
+/// The most bytes of the copies of textures the title fills that the sweep
+/// may let go of (`VICTORY_TEXTURE_COPIES_MB`, 1024), as
+/// [`crate::shadow::let_go_buffers`] has one for the copies of title buffers:
+/// the copies nothing names beyond it are let go, the longest unasked for
+/// first. A budget rather than "none" because a copy let go is made again,
+/// and its texture uploaded again, whole, the next time something asks for
+/// it. The copies the host copied into are not counted: their contents title
+/// memory does not have, so they cannot be let go at all, and counting them
+/// would let them push out every copy that can.
+#[cfg(windows)]
+fn copies_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_COPIES_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// What the sweep of the copies of title textures ([`let_go_idle`]) found of
+/// one copy.
+#[cfg(windows)]
+struct Named {
+    /// The title texture whose copy it is (its place in the table of
+    /// textures).
+    at: usize,
+    /// When title memory last asked for the copy ([`crate::host::moment`]).
+    used: u64,
+    /// The copy's bytes on the card.
+    bytes: u64,
+    /// Nothing but the texture holds it: no list not yet reset names it, no
+    /// submission is using it.
+    alone: bool,
+    /// No descriptor slot shows it: no draw can read it through a slot made
+    /// earlier.
+    unseen: bool,
+    /// The title memory behind it is not there any more.
+    gone: bool,
+    /// Nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+    idle: bool,
+}
+
+/// The copies of title textures to let go of now, of what the sweep found
+/// (`named`; `alive` is what the copies in `named` hold in all): the ones
+/// whose title memory is gone, then, while the copies left hold more than
+/// `most` bytes, those nothing asked for longest.
+#[cfg(windows)]
+fn choose(named: impl IntoIterator<Item = Named>, alive: u64, most: u64) -> Vec<usize> {
+    let mut let_go = Vec::new();
+    let mut left = alive;
+    let mut kept = Vec::new();
+    for one in named {
+        // Something names it (a list not yet reset, a submission, a
+        // descriptor slot), or it was asked for lately: it stays, whatever
+        // its memory.
+        if !one.alone || !one.unseen || !one.idle {
+            continue;
+        }
+        if one.gone {
+            left = left.saturating_sub(one.bytes);
+            let_go.push(one.at);
+        } else {
+            kept.push(one);
+        }
+    }
+    if left > most {
+        kept.sort_by_key(|one| one.used);
+        for one in kept {
+            if left <= most {
+                break;
+            }
+            left -= one.bytes;
+            let_go.push(one.at);
+        }
+    }
+    let_go
+}
+
+/// Forgets the placed textures at `ats` ([`PLACED_TEXTURES`]): their title
+/// memory is gone and their host copies went, so no ask will find that
+/// address and description again. The entry holds the only reference to the
+/// resource (`hand_out` added one and the title never got the pointer), so
+/// the last reference frees it and its `Drop` lets go of what it still held.
+/// An entry whose copy was made again in the meantime is kept: something
+/// asked for it after the sweep looked. Returns how many entries went.
+#[cfg(windows)]
+fn forget_placed(ats: &[usize]) -> usize {
+    let mut sorted = ats.to_vec();
+    sorted.sort_unstable();
+    let mut forgot = Vec::new();
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, &mut r| {
+            // One lock after the other, never the other way round: `texture_at`
+            // holds this one while it takes the table of textures.
+            let made = resource(r as This)
+                .host
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            let keep = made || sorted.binary_search(&r).is_err();
+            if !keep {
+                forgot.push(r);
+            }
+            keep
+        });
+    }
+    for r in &forgot {
+        object::release_boxed::<Resource>(*r as This);
+    }
+    forgot.len()
+}
+
+/// How many entries [`PLACED_TEXTURES`] holds, for the trail.
+#[cfg(windows)]
+fn placed_textures_left() -> usize {
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -1789,8 +1974,9 @@ impl Drop for HostTexture {
     }
 }
 
-/// How many textures placed in title memory have a resource of ours
-/// (never released), for the memory line.
+/// How many textures placed in title memory have a resource of ours, for
+/// the memory line; an entry whose title memory is gone and whose host copy
+/// nothing names is let go entry and all ([`forget_placed`]).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
     PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
@@ -2233,8 +2419,10 @@ pub(crate) extern "system" fn create_at_address(
 /// resource object (device 0x230, the title's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
-/// The resource is kept for the run (views and lists name its address);
-/// its host texture is let go when nothing names it any more
+/// The resource is kept while the title may still ask for it (views and
+/// lists name its address); once its title memory is gone and its host copy
+/// went, the entry goes too ([`forget_placed`]).
+/// Its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
@@ -2755,6 +2943,87 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    /// A copy of a title texture the sweep found: the texture holds it and,
+    /// what nothing here is: no list and no slot; its title memory is there
+    /// and nothing asked for it lately, unless the arguments say so.
+    #[cfg(windows)]
+    fn found(at: usize, bytes: u64, used: u64, gone: bool) -> Named {
+        Named {
+            at,
+            used,
+            bytes,
+            alone: true,
+            unseen: true,
+            gone,
+            idle: true,
+        }
+    }
+
+    #[cfg(windows)]
+    const MOST: u64 = 1 << 20;
+
+    /// A copy whose title memory is gone is let go, and at once: although the
+    /// copies alive are well within the budget.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_whose_title_memory_is_gone_is_let_go() {
+        let named = [
+            found(0x1000, 0x8000, 9, true),
+            found(0x2000, 0x4000, 9, true),
+        ];
+        let alive = 0xc000;
+        assert!(alive <= MOST, "the copies are within the budget");
+        assert_eq!(choose(named, alive, MOST), vec![0x1000, 0x2000]);
+    }
+
+    /// A copy still in use is kept: one a list or a submission holds, one a
+    /// descriptor slot shows, one asked for lately, and one nothing names
+    /// whose memory is there while the copies alive are within the budget.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_still_in_use_is_kept() {
+        let named = [
+            // A list not yet reset (or a submission) holds it: it stays, even
+            // though its title memory is gone.
+            Named {
+                alone: false,
+                ..found(0x1000, 0x8000, 9, true)
+            },
+            // A descriptor slot shows it: a draw could read it through the
+            // slot it made earlier.
+            Named {
+                unseen: false,
+                ..found(0x2000, 0x8000, 9, true)
+            },
+            // Title memory asked for it within the last frames: it is in use,
+            // so its memory not being there (yet, or any more) is no reason to
+            // make another copy of it.
+            Named {
+                idle: false,
+                ..found(0x3000, 0x8000, 9, true)
+            },
+            // Nothing names it, its memory is there, and the copies alive are
+            // within the budget: kept for the next ask.
+            found(0x4000, 0x1000, 9, false),
+        ];
+        assert_eq!(choose(named, 0x9000, MOST), vec![]);
+    }
+
+    /// Over the budget, the copies nothing asked for longest go first, and
+    /// only until what is left is within the budget.
+    #[cfg(windows)]
+    #[test]
+    fn over_budget_the_longest_unasked_for_goes_first() {
+        let named = [
+            found(0x1000, 0x4_0000, 1, false), // asked for longest ago
+            found(0x2000, 0x4_0000, 7, false),
+            found(0x3000, 0x4_0000, 9, false),
+        ];
+        // 768 KiB alive under a budget of 256 KiB: the two oldest go, 256 KiB
+        // left.
+        assert_eq!(choose(named, 0xc_0000, 0x4_0000), vec![0x1000, 0x2000]);
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
