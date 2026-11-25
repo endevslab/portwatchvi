@@ -18,8 +18,15 @@ directly is black.** Details, measurements and the method are below.
 
 ## Status, measured 2026-11-25
 
-Tested on one PC: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB, 32 GB RAM. The
-Series X profile is used throughout. Every number below was read from the layer's own
+Tested on one PC: Windows 11, AMD Ryzen 7 7700X, NVIDIA RTX 5070 12 GB, 32 GB RAM. The
+Series X profile is used throughout. The machine also has an AMD Radeon integrated GPU, and
+the layer currently takes whichever adapter Windows reports as its default.
+
+> **Likely wrong adapter.** `crates/victory-gpu/src/host.rs:603` creates the device with
+> `D3D12CreateDevice(None, ...)`, i.e. the adapter Windows considers default, without ever
+> enumerating them. On a machine with an integrated GPU, that can be the integrated one, which
+> would make every number in this file a measurement of the wrong card. Until the layer picks
+> the high-performance adapter explicitly, check which one it took before trusting a frame rate. Every number below was read from the layer's own
 instrumentation in a run of this repository's `diag` build; the runs and the method are in
 [`odd/tasks/fluid-world-frames.md`](odd/tasks/fluid-world-frames.md).
 
