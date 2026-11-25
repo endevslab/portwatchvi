@@ -454,10 +454,27 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
+    shadow.refresh(list, address, len);
     if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if let Some((scratch, _)) = crate::host::host().and_then(|host| host.shared_buffer(len)) {
+        crate::host::name(&scratch, || format!("list root-view scratch {len:#x}"));
+        list.keep(&scratch);
+        // SAFETY: both buffers are live until the list is reset; the refresh
+        // recorded above runs before this list, and the range lies in shadow.
+        let scratch_gpu = unsafe {
+            let scratch_gpu = scratch.GetGPUVirtualAddress();
+            list.list
+                .CopyBufferRegion(&scratch, 0, &shadow.buffer, gpu - shadow.buffer.GetGPUVirtualAddress(), len);
+            scratch_gpu
+        };
+        return Some(scratch_gpu);
+    }
+    static FALLBACK: std::sync::Once = std::sync::Once::new();
+    FALLBACK.call_once(|| {
+        tracing::warn!("card-backed root-view scratch is unavailable; falling back to a title-memory fill");
+    });
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
