@@ -886,7 +886,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
-    // What the title is told, logged at the first asking and at every
+    // What the title is told, logged at the first three askings and at every
     // 1,024th: "used" is all the process has committed, the layer's own
     // memory and the card's included (27 GB in run 60's gameplay against a
     // limit of 13.5 GB). A title that budgets its streaming from these two
@@ -896,7 +896,10 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // title asking.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
-    if asked.is_multiple_of(1024) {
+    // The first three asks are logged whatever they are: a title that asks
+    // once a minute never reaches a 1,024th boundary, and then the only
+    // figure it is told about its own budget is never written down at all.
+    if asked < 3 || asked.is_multiple_of(1024) {
         tracing::info!(
             asked = asked + 1,
             which = _which,
