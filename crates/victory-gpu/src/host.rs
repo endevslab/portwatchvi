@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, LUID, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -598,9 +598,26 @@ fn create() -> windows::core::Result<Host> {
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
+            // Named like the chosen adapter below, so that even here a log
+            // alone answers which card ran this.
+            match adapter
+                .cast::<IDXGIAdapter1>()
+                .ok()
+                .and_then(|adapter| adapter.GetDesc1().ok())
+            {
+                Some(desc) => tracing::info!(
+                    "host device on the software adapter (WARP): {}, {} MB of dedicated video memory, LUID {}",
+                    described(&desc.Description),
+                    (desc.DedicatedVideoMemory as u64) >> 20,
+                    luid_text(desc.AdapterLuid)
+                ),
+                None => tracing::info!("host device on the software adapter (WARP)"),
+            }
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Which card runs the title is chosen and named, not left to
+            // whatever adapter the system calls default (task
+            // `fluid-world-frames`, L36).
+            device = Some(device_on_chosen_adapter()?);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -675,6 +692,279 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// What the choice of adapter reads, and what the log names it by.
+#[derive(Debug, Clone, PartialEq)]
+struct AdapterInfo {
+    /// Its place in DXGI's own list (`IDXGIFactory1::EnumAdapters1`), which is
+    /// the index `VICTORY_ADAPTER` takes.
+    index: u32,
+    /// Its description, as DXGI gives it.
+    name: String,
+    /// `DXGI_ADAPTER_FLAG_SOFTWARE`: WARP and the like, which the layer never
+    /// takes on its own initiative.
+    software: bool,
+    dedicated_video_memory: u64,
+    luid: LUID,
+}
+
+/// Why the device is on the adapter it is on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Why {
+    /// `VICTORY_ADAPTER` names its index.
+    Index,
+    /// `VICTORY_ADAPTER` names part of its description.
+    Name,
+    /// DXGI's high-performance preference puts it first among hardware ones.
+    HighPerformance,
+    /// Nothing names it: it is the first hardware adapter DXGI lists.
+    FirstHardware,
+}
+
+impl Why {
+    fn said(self) -> &'static str {
+        match self {
+            Why::Index => "VICTORY_ADAPTER names its index",
+            Why::Name => "VICTORY_ADAPTER names part of its description",
+            Why::HighPerformance => {
+                "it is the first hardware adapter DXGI's high-performance preference names"
+            }
+            Why::FirstHardware => "it is the first hardware adapter DXGI lists",
+        }
+    }
+}
+
+/// The adapter to create the device on, and the whole reason for it.
+#[derive(Debug, Clone, PartialEq)]
+struct Pick {
+    /// Its position in the list [`pick`] is given.
+    at: usize,
+    why: Why,
+    /// A `VICTORY_ADAPTER` value that named nothing: ignored, and said so,
+    /// rather than fatal, so a typo costs the choice and not the run.
+    ignored: Option<String>,
+}
+
+/// Enough adapters for any PC, and a bound on the enumeration so a system that
+/// never reports its end cannot loop forever.
+const ADAPTERS_AT_MOST: u32 = 16;
+
+/// Every adapter DXGI lists, hardware and software, in DXGI's own order.
+fn adapters() -> windows::core::Result<Vec<(IDXGIAdapter1, AdapterInfo)>> {
+    // SAFETY: plain DXGI enumeration; the list owns each adapter it takes.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut listed = Vec::new();
+        let mut index = 0;
+        // `DXGI_ERROR_NOT_FOUND` past the last adapter, which is not a failure.
+        while index < ADAPTERS_AT_MOST
+            && let Ok(adapter) = factory.EnumAdapters1(index)
+        {
+            let desc = adapter.GetDesc1()?;
+            listed.push((adapter, info_of(index, &desc)));
+            index += 1;
+        }
+        Ok(listed)
+    }
+}
+
+/// What the log and the choice read about one adapter.
+fn info_of(index: u32, desc: &DXGI_ADAPTER_DESC1) -> AdapterInfo {
+    AdapterInfo {
+        index,
+        name: described(&desc.Description),
+        software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        dedicated_video_memory: desc.DedicatedVideoMemory as u64,
+        luid: desc.AdapterLuid,
+    }
+}
+
+/// A DXGI description's name as text, up to its first NUL.
+fn described(description: &[u16; 128]) -> String {
+    let end = description
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(description.len());
+    String::from_utf16_lossy(&description[..end])
+}
+
+/// A local adapter identifier as DXGI's own tools print it.
+fn luid_text(luid: LUID) -> String {
+    format!("{:08x}:{:08x}", luid.HighPart as u32, luid.LowPart)
+}
+
+/// The adapter DXGI's high-performance preference names first among hardware
+/// ones (`IDXGIFactory6::EnumAdapterByGpuPreference`), as its index in
+/// [`adapters`]; `None` where the system does not offer that order.
+fn preferred_hardware(listed: &[(IDXGIAdapter1, AdapterInfo)]) -> Option<u32> {
+    // SAFETY: plain DXGI enumeration in the high-performance order; the call
+    // fails with `DXGI_ERROR_NOT_FOUND` past the last adapter.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        for index in 0..ADAPTERS_AT_MOST {
+            let adapter = factory
+                .EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                    index,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                )
+                .ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                // The same adapter in DXGI's own order, for the index that
+                // `VICTORY_ADAPTER` and the log speak of.
+                return listed
+                    .iter()
+                    .map(|(_, info)| info)
+                    .find(|info| info.luid == desc.AdapterLuid)
+                    .map(|info| info.index);
+            }
+        }
+        None
+    }
+}
+
+/// Which of `infos` to create the device on, and why: `VICTORY_ADAPTER`
+/// (`wanted`) if it names one, otherwise `preferred` if DXGI's high-performance
+/// order named a hardware adapter, otherwise the first hardware adapter. Never
+/// a software one unless `VICTORY_ADAPTER` names it.
+fn pick(infos: &[AdapterInfo], preferred: Option<u32>, wanted: Option<&str>) -> Option<Pick> {
+    let mut ignored = None;
+    if let Some(wanted) = wanted {
+        let wanted = wanted.trim();
+        // An index as `VICTORY_ADAPTER=1`, else part of the description.
+        let by_index = wanted
+            .parse::<u32>()
+            .ok()
+            .and_then(|index| infos.iter().position(|info| info.index == index));
+        if let Some(at) = by_index {
+            return Some(Pick {
+                at,
+                why: Why::Index,
+                ignored,
+            });
+        }
+        let lower = wanted.to_lowercase();
+        if !lower.is_empty()
+            && let Some(at) = infos
+                .iter()
+                .position(|info| info.name.to_lowercase().contains(&lower))
+        {
+            return Some(Pick {
+                at,
+                why: Why::Name,
+                ignored,
+            });
+        }
+        ignored = Some(wanted.to_string());
+    }
+    let preferred = preferred
+        .and_then(|index| infos.iter().position(|info| info.index == index))
+        .filter(|&at| !infos[at].software);
+    if let Some(at) = preferred {
+        return Some(Pick {
+            at,
+            why: Why::HighPerformance,
+            ignored,
+        });
+    }
+    let at = infos.iter().position(|info| !info.software)?;
+    Some(Pick {
+        at,
+        why: Why::FirstHardware,
+        ignored,
+    })
+}
+
+/// Creates the host device on the card the layer chooses ([`pick`]) instead of
+/// on whichever adapter the system calls default, and names it at info before
+/// it is used: a log alone has to answer which card ran this.
+fn device_on_chosen_adapter() -> windows::core::Result<ID3D12Device> {
+    let listed = match adapters() {
+        Ok(listed) if !listed.is_empty() => listed,
+        Ok(_) => {
+            tracing::warn!("DXGI lists no adapter");
+            return default_device();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DXGI refused to list the adapters");
+            return default_device();
+        }
+    };
+    let infos: Vec<AdapterInfo> = listed.iter().map(|(_, info)| info.clone()).collect();
+    let preferred = preferred_hardware(&listed);
+    let wanted = std::env::var("VICTORY_ADAPTER").ok();
+    let Some(pick) = pick(&infos, preferred, wanted.as_deref()) else {
+        tracing::warn!(
+            "DXGI lists no hardware adapter ({})",
+            infos
+                .iter()
+                .map(|info| info.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return default_device();
+    };
+    if let Some(value) = &pick.ignored {
+        tracing::warn!(
+            "VICTORY_ADAPTER={value:?} names no adapter DXGI lists, so it is ignored and the layer chose by itself; the adapters are: {}",
+            infos
+                .iter()
+                .map(|info| format!("{} = {}", info.index, info.name))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    let (adapter, info) = &listed[pick.at];
+    tracing::info!(
+        "host device on adapter index {} of {} (VICTORY_ADAPTER={} takes it): {}, {} MB of dedicated video memory, LUID {}; chosen because {}",
+        info.index,
+        infos.len(),
+        info.index,
+        info.name,
+        info.dedicated_video_memory >> 20,
+        luid_text(info.luid),
+        pick.why.said()
+    );
+    // SAFETY: the adapter is one this call enumerated and still owns.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        match D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
+            Ok(()) => device.ok_or_else(windows::core::Error::empty),
+            Err(e) => {
+                tracing::warn!(error = %e, adapter = %info.name, "the adapter the layer picked refuses a device at feature level 12_0; falling back to the system's default adapter");
+                default_device()
+            }
+        }
+    }
+}
+
+/// Today's way, kept as the fallback: whatever adapter the system calls
+/// default. It is named from the device's own LUID, so the log still answers
+/// which card ran this.
+fn default_device() -> windows::core::Result<ID3D12Device> {
+    tracing::info!(
+        "host device on the system's default adapter: falling back to D3D12CreateDevice with no adapter chosen, which is how the layer always took one"
+    );
+    // SAFETY: plain D3D12 device creation, then a query on the device's own
+    // LUID to name the adapter it landed on.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        let device = device.ok_or_else(windows::core::Error::empty)?;
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            && let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+            && let Ok(desc) = adapter.GetDesc1()
+        {
+            tracing::info!(
+                "that device is on {}, {} MB of dedicated video memory, LUID {}",
+                described(&desc.Description),
+                (desc.DedicatedVideoMemory as u64) >> 20,
+                luid_text(desc.AdapterLuid)
+            );
+        }
+        Ok(device)
     }
 }
 
@@ -762,6 +1052,155 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    /// Two hardware adapters as this machine lists them: the APU's first, the
+    /// card second, which is how DXGI orders them here.
+    fn two_hardware() -> Vec<AdapterInfo> {
+        vec![
+            AdapterInfo {
+                index: 0,
+                name: "AMD Radeon(TM) Graphics".into(),
+                software: false,
+                dedicated_video_memory: 512 << 20,
+                luid: LUID {
+                    LowPart: 0x0000_0a0a,
+                    HighPart: 0,
+                },
+            },
+            AdapterInfo {
+                index: 1,
+                name: "NVIDIA GeForce RTX 5070".into(),
+                software: false,
+                dedicated_video_memory: 12 << 30,
+                luid: LUID {
+                    LowPart: 0x0000_0b0b,
+                    HighPart: 0,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn the_high_performance_adapter_is_chosen_over_the_first_listed() {
+        let infos = two_hardware();
+        assert_eq!(
+            pick(&infos, Some(1), None),
+            Some(Pick {
+                at: 1,
+                why: Why::HighPerformance,
+                ignored: None
+            }),
+        );
+    }
+
+    #[test]
+    fn a_software_adapter_is_never_chosen_on_the_layer_s_own_initiative() {
+        let mut infos = two_hardware();
+        infos[0].software = true;
+        infos[0].name = "Microsoft Basic Render Driver".into();
+        // Even where DXGI's own order names the software one first.
+        assert_eq!(
+            pick(&infos, Some(0), None),
+            Some(Pick {
+                at: 1,
+                why: Why::FirstHardware,
+                ignored: None
+            }),
+        );
+        // Nothing but software: no device of the layer's own choosing.
+        infos[1].software = true;
+        assert_eq!(pick(&infos, Some(0), None), None);
+    }
+
+    #[test]
+    fn the_override_names_an_adapter_by_index() {
+        let infos = two_hardware();
+        assert_eq!(
+            pick(&infos, Some(1), Some("0")),
+            Some(Pick {
+                at: 0,
+                why: Why::Index,
+                ignored: None
+            }),
+        );
+    }
+
+    #[test]
+    fn the_override_names_an_adapter_by_part_of_its_description_in_any_case() {
+        let infos = two_hardware();
+        for wanted in ["radeon", "Radeon(TM)", "amd radeon"] {
+            assert_eq!(
+                pick(&infos, Some(1), Some(wanted)),
+                Some(Pick {
+                    at: 0,
+                    why: Why::Name,
+                    ignored: None
+                }),
+                "VICTORY_ADAPTER={wanted}",
+            );
+        }
+        for wanted in ["geforce", "RTX 5070", "nvidia geforce rtx"] {
+            assert_eq!(
+                pick(&infos, Some(0), Some(wanted)),
+                Some(Pick {
+                    at: 1,
+                    why: Why::Name,
+                    ignored: None
+                }),
+                "VICTORY_ADAPTER={wanted}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_that_names_nothing_is_ignored_rather_than_fatal() {
+        let infos = two_hardware();
+        for wanted in ["4070", "9", ""] {
+            assert_eq!(
+                pick(&infos, Some(1), Some(wanted)),
+                Some(Pick {
+                    at: 1,
+                    why: Why::HighPerformance,
+                    ignored: Some(wanted.into())
+                }),
+                "VICTORY_ADAPTER={wanted}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_adapters_dxgi_lists_are_named_and_the_choice_is_a_hardware_one() {
+        // This probes DXGI without creating a D3D12 device or running a title.
+        let Ok(listed) = adapters() else { return };
+        if listed.is_empty() {
+            return;
+        }
+        let infos: Vec<AdapterInfo> = listed.into_iter().map(|(_, info)| info).collect();
+        for (at, info) in infos.iter().enumerate() {
+            eprintln!(
+                "adapter {at}: {} index {} software {} {} MB LUID {:08x}:{:08x}",
+                info.name,
+                info.index,
+                info.software,
+                info.dedicated_video_memory >> 20,
+                info.luid.HighPart as u32,
+                info.luid.LowPart,
+            );
+            assert_eq!(info.index, at as u32);
+            assert!(!info.name.is_empty(), "adapter {at} has no description");
+        }
+        // A machine with only software adapters has nothing to choose.
+        if infos.iter().all(|info| info.software) {
+            return;
+        }
+        let chosen = pick(&infos, None, None).expect("a hardware adapter is listed");
+        assert!(!infos[chosen.at].software, "{:?}", infos[chosen.at]);
+        assert_eq!(chosen.why, Why::FirstHardware);
+        // A substring of a listed adapter's own description names it.
+        let named = infos[chosen.at].name.clone();
+        let by_name = pick(&infos, None, Some(&named)).expect("its own description names it");
+        assert_eq!(by_name.at, chosen.at);
     }
 }
 
