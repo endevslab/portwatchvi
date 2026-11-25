@@ -35,3 +35,9 @@ L5 (review of the runner unit): the refuter found one introduced BLOCKER, R3-001
 L6 (A/B, card-side shadow comparison): `VICTORY_CARD_BUFFERS_MIN_MB=1` is not a win — ms/frame 1635 -> 2871 with the same fps, the CPU comparison only drops 404.8 -> 360.9 MB/frame, cpu user 2142 -> 1241 ms but kernel 983 -> 1160 ms. Discarded as the next lever.
 
 L7 (slice boundary): work units on `perf/fluid-world-frames` are `7b94d9e` (task file), `447471f` + `3063786` (runner, reviewed), `6be8cb6` (texture refresh). Delivery shape (one PR or chained) is a separate decision at publish time.
+
+L8 (review of the texture/lock/copy unit): approved, lineage `review-297b78f6690118a9`. The reliability lens first died twice on a provider generation failure (44k and 46k reasoning tokens, no verdict); after the reviewer output ceiling was raised it produced the verdict. Open advisories: R3-001 `Invoke-DiagRun` prints but does not propagate `$LASTEXITCODE`; R3-002 a copy is treated as gone from one failed kernel byte read, which can also fail while the runtime is remapping; R3-003 the over-budget eviction branch had no test.
+
+L9 (memory ledger, three-minute run): our attributed side totals ~10.2 GB in both runs and the residual ~8 GB is never attributed by any log line (likely the title's own commit and driver heaps). Pools that grow: `host textures` 7 -> 10921 alive (4504 MB), copies the title fills 1 -> 9955 alive (1592 MB), `shapes of placed views kept` 477 -> 55440. The first sweep let go of twice as many windows (635 / 2924 MB vs 304 / 1424 MB) but the run still ended at the same private memory, so the sweep alone was not the fix.
+
+L10 (slice boundary): the branch is now past the review slice. Slices: `7b94d9e`+`447471f`+`3063786` (runner), `6be8cb6` (texture lock), `6ce1c87`+`e240794` (buffer-copy sweep), `3b0b36c` (placed-texture pools). Each work unit was reviewed or is pending review; the delivery shape (one PR or chained) stays a decision at publish time.
