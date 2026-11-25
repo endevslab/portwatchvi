@@ -12,6 +12,8 @@ S3. The GPU is not the target: per-command GPU timings are 0.7-1.25 ms/frame and
 
 S4. A shader or pipeline that cannot be translated is out of scope for frame time; the 745-4067 permanently dropped draws per report window remove GPU work and must not be "fixed" by dropping more.
 
+S5. The user's report, verbatim: "asi esta apareciendo la imagen corrigelo", with two captures of the prologue showing (a) a character silhouette smeared across half the frame with straight clipping edges and (b) a hard-edged black rectangle in the upper right. Requirement: the world must be drawn from the payload of its own frame. No draw may consume another frame's meshlet payload, and no geometry may be drawn from a buffer whose fill was skipped.
+
 ## Tasks
 
 - T1 (S1, S2) — Make the texture refresh never block on the title-memory mapping lock. Route: inline evidence already gathered; writer for the code. Commit: `6be8cb6`. Tests: 112 pass, 3 consecutive runs; the new cases take turns on a module mutex because the mapping lock is process-wide.
@@ -19,6 +21,7 @@ S4. A shader or pipeline that cannot be translated is out of scope for frame tim
 - T3 (S1, S2) — Name the remaining title-side gap: symbolize the hot RVAs (`victory.exe+0x5fb511`, `0x614c23`, `0x5fb713`, `0x1247c2`, `0xe6769`, `0xd5a24`) against `target/diag/victory.pdb`, then attack what the symbol shows ("the title had not submitted" = 900 ms/frame). Route: parent + writer. Commit: work unit 3.
 - T4 (S1, S2) — Reduce the remaining host-side buckets (heap-buffer texture pass 253 ms, `copying back` 82-212 ms) guided by the same meters. Route: writer. Commit: work unit 4.
 - T5 (S1-S4) — Verify end to end: A/B driver runs in the world, report ms/frame, fps, and that the frame image did not regress. Route: parent. No commit.
+- T6 (S5) — Run the title's indirect mesh dispatches instead of dropping them. `list.rs:1594-1608` returns early whenever the group count lives in GPU memory ("shortcut: dispatches whose group count is in GPU memory (indirect) are dropped"), so the frame's meshlet culling never runs and a later mesh draw consumes a stale payload: that is the smeared silhouette. Implement it as `ExecuteIndirect` with a mesh command signature under the existing argument-clamp budget (`indirect.rs`, `signature`), count what is skipped instead of warning once, and prove it with captures. Route: writer. Commit: work unit 5.
 
 ## Log
 
