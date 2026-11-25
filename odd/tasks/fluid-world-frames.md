@@ -14,8 +14,8 @@ S4. A shader or pipeline that cannot be translated is out of scope for frame tim
 
 ## Tasks
 
-- T1 (S1, S2) — Make the texture refresh never block on the title-memory mapping lock. Route: inline evidence already gathered; writer for the code. Commit: work unit 1.
-- T2 (S1, S2) — Commit the `diagnose.ps1` runner repairs (stderr no longer aborts the run, UTF-8 logs) plus the review advisories that hold: `$LASTEXITCODE` checks, explicit out-dir argument, non-zero exit on an unknown command. Route: inline. Commit: work unit 0.
+- T1 (S1, S2) — Make the texture refresh never block on the title-memory mapping lock. Route: inline evidence already gathered; writer for the code. Commit: `6be8cb6`. Tests: 112 pass, 3 consecutive runs; the new cases take turns on a module mutex because the mapping lock is process-wide.
+- T2 (S1, S2) — Commit the `diagnose.ps1` runner repairs (stderr no longer aborts the run, UTF-8 logs) plus the review advisories that hold: `$LASTEXITCODE` checks, explicit out-dir argument, non-zero exit on an unknown command. Route: inline. Commit: `7b94d9e` (task file), `447471f` (runner), `3063786` (correction: relative out-dir without the two-argument `GetFullPath`, which does not exist on .NET Framework). Reviewed: lineage `review-11de453f5221c103`, approved.
 - T3 (S1, S2) — Name the remaining title-side gap: symbolize the hot RVAs (`victory.exe+0x5fb511`, `0x614c23`, `0x5fb713`, `0x1247c2`, `0xe6769`, `0xd5a24`) against `target/diag/victory.pdb`, then attack what the symbol shows ("the title had not submitted" = 900 ms/frame). Route: parent + writer. Commit: work unit 3.
 - T4 (S1, S2) — Reduce the remaining host-side buckets (heap-buffer texture pass 253 ms, `copying back` 82-212 ms) guided by the same meters. Route: writer. Commit: work unit 4.
 - T5 (S1-S4) — Verify end to end: A/B driver runs in the world, report ms/frame, fps, and that the frame image did not regress. Route: parent. No commit.
@@ -29,3 +29,9 @@ L2 (evidence, previous probe): the title renders the menu at 30 fps / 33 ms with
 L3 (evidence, diagnosis): `VICTORY_TEXTURE_NO_WAIT=1` A/B — ms/frame 2780 -> 1635, textures 1188 -> 16 ms, refresh "waiting for title memory to hold still" 964 -> 0 ms, cpu user per 5 s window 16674 -> 2142 ms. The lock is held by `Staging::refresh` across the write-watch query, a whole-texture blake3 and the detile (crates/victory-gpu/src/texture.rs:667-741) while the runtime takes it alone to remap.
 
 L4 (evidence, after the A/B): the residual frame is "the title had not submitted" 900 ms/frame with our own thread working 217 ms, so the next target is title-side time, not host preparation. The main thread parks in `WaitForSingleObject` from `victory.exe+0x5fb511` in both runs.
+
+L5 (review of the runner unit): the refuter found one introduced BLOCKER, R3-001 — the two-argument `Path.GetFullPath` does not exist on .NET Framework. Reproduced on this host (`MethodException: no overload with 2 arguments`) and corrected in `3063786`. Non-blocking advisories that stay open as follow-ups: `Out-Dir`'s `$Root` parameter and local `$root` are one case-insensitive variable (R2-case-insensitive-root); `Invoke-DiagRun` reads the script-scope `$Rest[0]` instead of taking the exe path as a parameter (R2-implicit-rest); the helper only prints `$LASTEXITCODE` and the script still exits 0 after a failed title run (R2-masked-exit).
+
+L6 (A/B, card-side shadow comparison): `VICTORY_CARD_BUFFERS_MIN_MB=1` is not a win — ms/frame 1635 -> 2871 with the same fps, the CPU comparison only drops 404.8 -> 360.9 MB/frame, cpu user 2142 -> 1241 ms but kernel 983 -> 1160 ms. Discarded as the next lever.
+
+L7 (slice boundary): work units on `perf/fluid-world-frames` are `7b94d9e` (task file), `447471f` + `3063786` (runner, reviewed), `6be8cb6` (texture refresh). Delivery shape (one PR or chained) is a separate decision at publish time.
