@@ -56,6 +56,7 @@ Speed and memory:
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
+- Host copies of title buffers no longer stay for the run: the copies no list, no submission and no descriptor slot names, and whose title memory is gone, are let go, and what stays behind them is capped (`VICTORY_BUFFER_COPIES_MB`, 1024) — the world's streaming was leaving 4,255 copies (4.3 GB) alive three minutes in.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).

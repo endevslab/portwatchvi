@@ -178,8 +178,8 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 }
 
 /// Once a second, before a submission starts: lets go of what nothing
-/// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// names any more (copies of windows of title memory, copies of title
+/// buffers, staging buffers, host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
@@ -200,6 +200,7 @@ fn sweep() {
     }
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
+    crate::shadow::let_go_buffers();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }

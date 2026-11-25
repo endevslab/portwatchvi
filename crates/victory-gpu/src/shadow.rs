@@ -55,7 +55,8 @@ pub(crate) struct Shadow {
     kept: Mutex<(Vec<bool>, bool)>,
     /// When the copy was last asked for (`crate::host::moment`): a window
     /// outside buffers nothing asked for in a while, and nothing holds, is
-    /// let go ([`let_go_idle`]).
+    /// let go ([`let_go_idle`]); so is a title buffer's copy
+    /// ([`let_go_buffers`]).
     used: AtomicU64,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
@@ -1607,6 +1608,161 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// The most bytes of copies of title buffers the table keeps
+/// (`VICTORY_BUFFER_COPIES_MB`, 1024): the copies nothing names beyond it are
+/// let go, the longest unasked for first ([`let_go_buffers`]). A budget
+/// rather than "none" because a copy let go is copied again, whole, the
+/// next time something asks for it.
+fn copies_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_BUFFER_COPIES_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// What the sweep of the copies of title buffers ([`let_go_buffers`]) found
+/// of one copy: the table's key, and everything that keeps it.
+struct Named {
+    /// The table's key: the title buffer's start and its resource.
+    key: (u64, usize),
+    /// When title memory last asked for the copy ([`crate::host::moment`]).
+    used: u64,
+    /// The copy's bytes of title memory.
+    bytes: u64,
+    /// Nothing but the table holds it: no list not yet reset names it, no
+    /// submission is copying it back.
+    alone: bool,
+    /// No descriptor slot shows its buffer: no draw can read it through a
+    /// slot made earlier.
+    unseen: bool,
+    /// The title memory behind it is not there any more.
+    gone: bool,
+    /// Nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+    idle: bool,
+}
+
+/// The copies of title buffers to let go of now, of what the sweep found
+/// (`named`; `alive` is what the copies in the table hold in all): the ones
+/// whose title memory is gone, then, while the copies alive hold more than
+/// `most` bytes, those nothing asked for longest.
+fn choose(named: impl IntoIterator<Item = Named>, alive: u64, most: u64) -> Vec<((u64, usize), u64)> {
+    let mut let_go = Vec::new();
+    let mut left = alive;
+    let mut kept = Vec::new();
+    for one in named {
+        // Something names it (a list not yet reset, a submission, a
+        // descriptor slot), or it was asked for lately: it stays, whatever
+        // its memory.
+        if !one.alone || !one.unseen || !one.idle {
+            continue;
+        }
+        if one.gone {
+            left = left.saturating_sub(one.bytes);
+            let_go.push((one.key, one.bytes));
+        } else {
+            kept.push(one);
+        }
+    }
+    if left > most {
+        kept.sort_by_key(|one| one.used);
+        for one in kept {
+            if left <= most {
+                break;
+            }
+            left -= one.bytes;
+            let_go.push((one.key, one.bytes));
+        }
+    }
+    let_go
+}
+
+/// Lets go of the copies of title buffers that nothing names any more
+/// (`host::sweep`). The title released a copy only with the buffer it stands
+/// for (`unregister`), and the world's streaming keeps its buffers: 1 copy
+/// (174 MB) when the opening scenes began was 4,255 (4.3 GB) three minutes
+/// into the world, each one a buffer in the PC's memory as big as the
+/// title's and the shared buffer made for it (4,937 made, 6.1 GB).
+/// Windows outside buffers ([`let_go_idle`]), staging buffers and host
+/// textures had a sweep each; the copies of title buffers had none.
+/// A copy goes when
+/// - only the table holds it: no list not yet reset names it, no submission
+///   is copying it back;
+/// - only the copy holds its host buffer: no descriptor slot views it (a
+///   slot keeps the buffer it views, `HostHeap::kept`), so no draw can read
+///   it through a slot made earlier;
+/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames;
+/// - and either the title memory behind it is gone (`read_into` fails: not a
+///   page of it can be copied from it any more), or the copies alive hold
+///   more than [`copies_most`], the longest unasked for going first.
+///
+/// The next ask makes the copy anew, and copies the buffer's pages again:
+/// the write-watch state is the journal's, not the copy's, so no stale bytes
+/// are kept. A title buffer whose copy went keeps its place in the table
+/// (`Entry`), so asks still find the buffer. Called before a submission
+/// starts, by the thread that submits.
+pub(crate) fn let_go_buffers() {
+    const IDLE_MS: u64 = 10_000;
+    const IDLE_FRAMES: u64 = 4;
+    let most = copies_most();
+    let mut let_go: Vec<Arc<Shadow>> = Vec::new();
+    {
+        // Held from the look to the removal: `lookup` hands a copy out under
+        // the same lock, so none is handed out in between.
+        let mut map = buffers();
+        let mut alive = 0u64;
+        let mut named = Vec::new();
+        for (key, entry) in map.iter() {
+            let Some(shadow) = &entry.shadow else { continue };
+            if shadow.place.is_some() {
+                // In place: the title's own memory, nothing copied
+                // (`in_place_let_go`).
+                continue;
+            }
+            alive += shadow.len;
+            // Cheapest first: the copy's count, then its buffer's (a pair of
+            // calls), then a byte of title memory through the kernel.
+            let alone = Arc::strong_count(shadow) == 1;
+            let unseen = alone && crate::host::references(&shadow.buffer) == 1;
+            let used = shadow.used.load(Ordering::Relaxed);
+            let idle = crate::host::long_ago(used, IDLE_MS, IDLE_FRAMES);
+            let mut byte = [0u8; 1];
+            named.push(Named {
+                key: *key,
+                used,
+                bytes: shadow.len,
+                alone,
+                unseen,
+                gone: unseen
+                    && idle
+                    && !crate::host::read_into(shadow.start as *const u8, &mut byte),
+                idle,
+            });
+        }
+        for (key, _) in choose(named, alive, most) {
+            if let Some(shadow) = map.get_mut(&key).and_then(|entry| entry.shadow.take()) {
+                let_go.push(shadow);
+            }
+        }
+    }
+    if let_go.is_empty() {
+        return;
+    }
+    let (went, bytes) = (let_go.len(), let_go.iter().map(|s| s.len).sum::<u64>());
+    tracing::info!(went, mb = bytes >> 20, "host copies of title buffers nothing names any more let go");
+    crate::host::trail(|| {
+        format!("sweep: {went} host copies of title buffers let go ({} KiB), held by no list and no slot", bytes >> 10)
+    });
+    for shadow in let_go {
+        // Nothing runs now and nothing names it: freed at once unless a
+        // submission is running after all.
+        crate::host::retire(shadow);
+    }
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -2939,7 +3095,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    let shadow = entry.shadow.clone()?;
+    // A copy nothing asks for in a while may be let go (`let_go_buffers`).
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    Some(shadow)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3149,6 +3308,67 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{Named, choose};
+
+    /// A copy of a title buffer the sweep found: the table holds it and,
+    /// what nothing here is: no list and no slot.
+    fn found(key: (u64, usize), bytes: u64, held: bool, shown: bool, gone: bool, idle: bool) -> Named {
+        Named {
+            key,
+            used: 10,
+            bytes,
+            alone: !held,
+            unseen: !shown,
+            gone,
+            idle,
+        }
+    }
+
+    const MOST: u64 = 1 << 20;
+
+    /// A copy whose title memory is gone is let go (the table no longer
+    /// holds it), and at once: although the copies alive are well within the
+    /// budget, and although it went without a copy being made for it since.
+    #[test]
+    fn a_copy_whose_title_memory_is_gone_is_let_go() {
+        let gone = (0xd_1000_0000u64, 0x1000usize);
+        let also = (0xe_0000_0000, 0x2000);
+        let named = [
+            found(gone, 0x8000, false, false, true, true),
+            found(also, 0x4000, false, false, true, true),
+        ];
+        let alive = 0xc000;
+        assert!(alive <= MOST, "the copies are within the budget");
+        let let_go = choose(named, alive, MOST);
+        assert_eq!(let_go, vec![(gone, 0x8000), (also, 0x4000)]);
+    }
+
+    /// A copy still in use is kept: one a list or a submission holds, one a
+    /// descriptor slot shows, one asked for lately, and one nothing names
+    /// whose memory is there while the copies alive are within the budget.
+    #[test]
+    fn a_copy_still_in_use_is_kept() {
+        let named = [
+            // A list not yet reset (or a submission) holds it: it stays,
+            // even though its title memory is gone.
+            found((0xd_1000_0000, 0x1000), 0x8000, true, false, true, true),
+            // A descriptor slot shows it: a draw could read it through the
+            // slot it made earlier.
+            found((0xd_2000_0000, 0x1000), 0x8000, false, true, true, true),
+            // Title memory asked for it within the last frames: it is in
+            // use, so its memory not being there (yet, or any more) is no
+            // reason to make another copy of it.
+            found((0xd_3000_0000, 0x1000), 0x8000, false, false, true, false),
+            // Nothing names it, its memory is there, and the copies alive
+            // are within the budget: kept for the next ask.
+            found((0xd_4000_0000, 0x1000), 0x1000, false, false, false, true),
+        ];
+        assert_eq!(choose(named, 0x9000, MOST), vec![]);
+    }
 }
 
 #[cfg(test)]
