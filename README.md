@@ -2,7 +2,8 @@
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak — a
 compatibility layer that runs an Xbox Series title natively on Windows from files the user
-supplies. It follows upstream `main` and carries the fixes of
+supplies. The title this fork is built and measured against is the leaked Xbox Series build
+of **Grand Theft Auto VI**. It follows upstream `main` and carries the fixes of
 [hyphennn's victory-fork](https://github.com/fxceless/victory-fork) (upstream's own README
 and history are there, not repeated here), plus the work recorded in
 [`odd/tasks/fluid-world-frames.md`](odd/tasks/fluid-world-frames.md).
@@ -11,6 +12,9 @@ and history are there, not repeated here), plus the work recorded in
 game. It is not affiliated with or endorsed by the game's developer or publisher.
 
 GPL-3.0-or-later, like VIctory.
+
+**Where it stands: the prologue renders at 2-3 fps and everything the sun does not hit
+directly is black.** Details, measurements and the method are below.
 
 ## Status, measured 2026-11-25
 
